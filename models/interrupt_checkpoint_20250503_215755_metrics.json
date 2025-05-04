@@ -1,0 +1,8 @@
+{
+  "puzzle_accuracy": [],
+  "average_reward": [],
+  "policy_loss": [],
+  "value_loss": [],
+  "entropy": [],
+  "stockfish_agreement": []
+}
