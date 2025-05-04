@@ -10,27 +10,27 @@ class PolicyNetwork(nn.Module):
     def __init__(self, config):
         super().__init__()
         
-        # Board state encoder
+        # Board state encoder - replacing BatchNorm with LayerNorm for single-sample support
         self.board_encoder = nn.Sequential(
             nn.Linear(config.board_feature_dim, 1024),
             nn.ReLU(),
-            nn.BatchNorm1d(1024),
+            nn.LayerNorm(1024),  # Changed from BatchNorm1d
             nn.Dropout(0.3),
             
             nn.Linear(1024, 512),
             nn.ReLU(),
-            nn.BatchNorm1d(512),
+            nn.LayerNorm(512),   # Changed from BatchNorm1d
             nn.Dropout(0.3),
             
             nn.Linear(512, 256),
             nn.ReLU()
         )
         
-        # Move encoder
+        # Move encoder - replacing BatchNorm with LayerNorm
         self.move_encoder = nn.Sequential(
             nn.Linear(config.move_feature_dim, 256),
             nn.ReLU(),
-            nn.BatchNorm1d(256),
+            nn.LayerNorm(256),   # Changed from BatchNorm1d
             
             nn.Linear(256, 256),
             nn.ReLU()
@@ -40,7 +40,8 @@ class PolicyNetwork(nn.Module):
         self.attention = nn.MultiheadAttention(
             embed_dim=256,
             num_heads=8,
-            dropout=0.1
+            dropout=0.1,
+            batch_first=True  # Added batch_first=True for consistency
         )
         
         # Final policy head
@@ -62,6 +63,10 @@ class PolicyNetwork(nn.Module):
         if board_features.dim() == 1:
             board_features = board_features.unsqueeze(0)
         
+        # Handle edge case: if no moves, return empty tensor
+        if not move_features_list:
+            return torch.tensor([], device=board_features.device)
+        
         # Encode board state
         board_embedding = self.board_encoder(board_features)
         
@@ -76,24 +81,34 @@ class PolicyNetwork(nn.Module):
         # Stack move embeddings
         move_embeddings = torch.stack(move_embeddings)  # [num_moves, batch_size, embed_dim]
         
+        # Transpose for batch_first attention
+        move_embeddings = move_embeddings.transpose(0, 1)  # [batch_size, num_moves, embed_dim]
+        
         # Use attention to score moves based on board state
         # board_embedding as query, move_embeddings as key/value
         attended_moves, attention_weights = self.attention(
-            board_embedding.unsqueeze(0),  # [1, batch_size, embed_dim]
-            move_embeddings,                # [num_moves, batch_size, embed_dim]
-            move_embeddings                 # [num_moves, batch_size, embed_dim]
+            board_embedding.unsqueeze(1),   # [batch_size, 1, embed_dim]
+            move_embeddings,                 # [batch_size, num_moves, embed_dim]
+            move_embeddings                  # [batch_size, num_moves, embed_dim]
         )
         
         # Get scores for each move
         move_scores = []
-        for i in range(attended_moves.size(0)):
-            score = self.policy_head(attended_moves[i])
+        for i in range(attended_moves.size(1)):
+            score = self.policy_head(attended_moves[:, i])
             move_scores.append(score)
         
-        move_scores = torch.cat(move_scores, dim=0)
+        if move_scores:
+            move_scores = torch.cat(move_scores, dim=0)
+        else:
+            move_scores = torch.tensor([], device=board_features.device)
+        
+        # Handle single move case - ensure tensor is at least 1D
+        if move_scores.dim() == 0:
+            move_scores = move_scores.unsqueeze(0)
         
         # Return probability distribution
-        return torch.softmax(move_scores.squeeze(), dim=0)
+        return torch.softmax(move_scores, dim=0)
 
 
 class ValueNetwork(nn.Module):
@@ -102,20 +117,21 @@ class ValueNetwork(nn.Module):
     def __init__(self, config):
         super().__init__()
         
+        # Replace BatchNorm with LayerNorm for single-sample support
         self.network = nn.Sequential(
             nn.Linear(config.board_feature_dim, 1024),
             nn.ReLU(),
-            nn.BatchNorm1d(1024),
+            nn.LayerNorm(1024),  # Changed from BatchNorm1d
             nn.Dropout(0.3),
             
             nn.Linear(1024, 512),
             nn.ReLU(),
-            nn.BatchNorm1d(512),
+            nn.LayerNorm(512),   # Changed from BatchNorm1d
             nn.Dropout(0.3),
             
             nn.Linear(512, 256),
             nn.ReLU(),
-            nn.BatchNorm1d(256),
+            nn.LayerNorm(256),   # Changed from BatchNorm1d
             
             nn.Linear(256, 128),
             nn.ReLU(),

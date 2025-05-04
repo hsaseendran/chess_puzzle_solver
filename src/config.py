@@ -8,8 +8,8 @@ class TrainingConfig:
     """Configuration for training the chess puzzle solver"""
     
     # Model architecture
-    board_feature_dim: int = 832  # Based on feature extractor
-    move_feature_dim: int = 16    # Based on feature extractor
+    board_feature_dim: int = 860  # Calculated from feature extractor
+    move_feature_dim: int = 16    # Calculated from feature extractor
     
     # Training parameters
     batch_size: int = 64

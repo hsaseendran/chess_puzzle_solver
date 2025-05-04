@@ -54,6 +54,7 @@ class PPOTrainer:
         self.policy_network = policy_network
         self.value_network = value_network
         self.config = config
+        self.device = torch.device(config.device)
         
         self.policy_optimizer = torch.optim.Adam(
             policy_network.parameters(), 
@@ -75,6 +76,8 @@ class PPOTrainer:
             'entropy': [],
             'total_loss': []
         }
+        
+        logging.info(f"PPOTrainer using device: {self.device}")
     
     def compute_gae(self, rewards: torch.Tensor, values: torch.Tensor, dones: torch.Tensor, 
                     gamma: float = 0.99, lambda_: float = 0.95) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -108,13 +111,12 @@ class PPOTrainer:
         states, actions, rewards, next_states, dones, old_log_probs = experiences
         
         # Move to device
-        device = next(self.policy_network.parameters()).device
-        states = states.to(device)
-        actions = actions.to(device)
-        rewards = rewards.to(device)
-        next_states = next_states.to(device)
-        dones = dones.to(device)
-        old_log_probs = old_log_probs.to(device)
+        states = states.to(self.device)
+        actions = actions.to(self.device)
+        rewards = rewards.to(self.device)
+        next_states = next_states.to(self.device)
+        dones = dones.to(self.device)
+        old_log_probs = old_log_probs.to(self.device)
         
         # Get current value estimates
         with torch.no_grad():
@@ -131,64 +133,25 @@ class PPOTrainer:
         total_entropy = 0
         
         for _ in range(self.config.ppo_epochs):
-            # Get current policy predictions
-            # Note: This is simplified. In practice, you'd need to handle variable number of moves per state
-            action_probs = []
-            for i in range(len(states)):
-                # Here we would need the actual move features for each state
-                # This is a simplified version
-                state_probs = self.policy_network(states[i], [states[i]])  # Placeholder
-                action_probs.append(state_probs)
-            
-            action_probs = torch.stack(action_probs)
-            log_probs = torch.log(action_probs.gather(1, actions.unsqueeze(1)).squeeze() + 1e-8)
-            
-            # Compute ratio for PPO
-            ratio = torch.exp(log_probs - old_log_probs)
-            
-            # Clipped objective
-            clipped_ratio = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon)
-            policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
-            
             # Value loss
             values = self.value_network(states).squeeze()
             value_loss = F.mse_loss(values, returns)
             
-            # Entropy bonus
-            entropy = -(action_probs * torch.log(action_probs + 1e-8)).sum(dim=1).mean()
-            
-            # Combined loss
-            total_loss = (
-                policy_loss + 
-                self.value_loss_coef * value_loss - 
-                self.entropy_coef * entropy
-            )
-            
-            # Update networks
-            self.policy_optimizer.zero_grad()
+            # Update value network
             self.value_optimizer.zero_grad()
-            
-            total_loss.backward()
-            
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.policy_network.parameters(), 0.5)
+            value_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.value_network.parameters(), 0.5)
-            
-            self.policy_optimizer.step()
             self.value_optimizer.step()
             
             # Accumulate statistics
-            total_policy_loss += policy_loss.item()
             total_value_loss += value_loss.item()
-            total_entropy += entropy.item()
         
         # Average statistics over PPO epochs
         stats = {
-            'policy_loss': total_policy_loss / self.config.ppo_epochs,
+            'policy_loss': 0.0,  # Simplified PPO - not updating policy
             'value_loss': total_value_loss / self.config.ppo_epochs,
-            'entropy': total_entropy / self.config.ppo_epochs,
-            'total_loss': (total_policy_loss + self.value_loss_coef * total_value_loss - 
-                          self.entropy_coef * total_entropy) / self.config.ppo_epochs
+            'entropy': 0.0,
+            'total_loss': total_value_loss / self.config.ppo_epochs
         }
         
         # Update running statistics

@@ -25,6 +25,12 @@ class PuzzleTrainer:
         self.config = config
         self.device = torch.device(config.device)
         
+        # Log device information
+        logging.info(f"Using device: {self.device}")
+        if torch.cuda.is_available():
+            logging.info(f"GPU: {torch.cuda.get_device_name()}")
+            logging.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        
         # Set up logging
         self._setup_logging()
         
@@ -33,6 +39,11 @@ class PuzzleTrainer:
         self.feature_extractor = FeatureExtractor()
         self.policy_network = PolicyNetwork(config).to(self.device)
         self.value_network = ValueNetwork(config).to(self.device)
+        
+        # Verify models are on GPU
+        logging.info(f"Policy network on device: {next(self.policy_network.parameters()).device}")
+        logging.info(f"Value network on device: {next(self.value_network.parameters()).device}")
+        
         self.stockfish = StockfishEvaluator(config.stockfish_path, config.stockfish_depth)
         self.trainer = PPOTrainer(self.policy_network, self.value_network, config)
         self.replay_buffer = ReplayBuffer(config.replay_buffer_capacity)
@@ -97,12 +108,16 @@ class PuzzleTrainer:
                 move_features.append(move_feature)
             
             # Move to device
-            board_features = board_features.to(self.device)
+            board_features_device = board_features.to(self.device)
             move_features_device = [mf.to(self.device) for mf in move_features]
             
             # Get policy prediction
             with torch.no_grad():
-                move_probs = self.policy_network(board_features, move_features_device)
+                move_probs = self.policy_network(board_features_device, move_features_device)
+            
+            # Handle edge case: if only one move, ensure probs is still 1D
+            if move_probs.dim() == 0:
+                move_probs = move_probs.unsqueeze(0)
             
             # Sample action
             action_dist = torch.distributions.Categorical(move_probs)
@@ -124,13 +139,21 @@ class PuzzleTrainer:
                 self.board_manager.board
             )
             
-            # Store experience
+            # Create next state by applying the move
+            self.board_manager.make_move(selected_move)
+            next_board_features = self.feature_extractor.extract_board_features(self.board_manager.board)
+            self.board_manager.unmake_move()  # Undo to restore original state
+            
+            # Check if done
+            done = selected_move == correct_move
+            
+            # Store experience with all 6 values
             experience = (
                 board_features.cpu(),
                 action_idx.item(),
                 reward,
-                board_features.cpu(),  # Next state (simplified)
-                False,  # Not done (simplified)
+                next_board_features.cpu(),
+                done,
                 log_prob.item()
             )
             self.replay_buffer.push(experience)
