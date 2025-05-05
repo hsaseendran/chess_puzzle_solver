@@ -1,272 +1,378 @@
 #!/usr/bin/env python3
-"""
-Evaluate the chess puzzle solver model
-"""
 
+import argparse
+import torch
+import logging
+import pandas as pd
+from torch.utils.data import Subset
+from tqdm import tqdm
+import chess
+import json
+from collections import defaultdict
+import matplotlib.pyplot as plt
+import numpy as np
 import os
 import sys
-import argparse
-import pandas as pd
-import numpy as np
-import logging
-from datetime import datetime
-import json
-import matplotlib.pyplot as plt
-from collections import defaultdict
 
-# Add parent directory to path to import modules
-parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if parent_dir not in sys.path:
-    sys.path.insert(0, parent_dir)
+# Add parent directory to path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.config import TrainingConfig, EvaluationConfig
-from src.puzzle_trainer import PuzzleTrainer
+from src.model import ChessPuzzleNet
+from src.dataset import ChessPuzzleDataset
 
 
-def analyze_by_difficulty(results_df: pd.DataFrame, config: EvaluationConfig):
-    """Analyze results by puzzle difficulty rating"""
-    results_by_rating = defaultdict(list)
+def evaluate_puzzle(model, board_tensor, solution_move, legal_moves, device):
+    """Evaluate a single puzzle"""
+    with torch.no_grad():
+        board_tensor = board_tensor.unsqueeze(0).to(device)
+        policy_output, value_output = model(board_tensor)
+        
+        # Get predicted move
+        predicted_idx = torch.argmax(policy_output).item()
+        predicted_move = ChessPuzzleDataset.index_to_move(predicted_idx)
+        
+        # Check if move is legal
+        if predicted_move in legal_moves:
+            is_correct = (predicted_move == solution_move)
+        else:
+            is_correct = False
+            # Find the legal move with highest score
+            legal_move_indices = [move.from_square * 64 + move.to_square for move in legal_moves]
+            legal_move_scores = policy_output[0, legal_move_indices]
+            best_legal_idx = legal_move_indices[torch.argmax(legal_move_scores).item()]
+            predicted_move = ChessPuzzleDataset.index_to_move(best_legal_idx)
+        
+        # Get confidence (softmax probability)
+        probs = torch.softmax(policy_output[0], dim=0)
+        confidence = probs[predicted_idx].item()
+        
+        # Get value
+        position_value = value_output.item()
+        
+        return is_correct, predicted_move, confidence, position_value
+
+
+def analyze_by_rating(results_df):
+    """Analyze results by rating buckets"""
+    buckets = [(0, 1000), (1000, 1500), (1500, 2000), (2000, 2500), (2500, 3000), (3000, 4000)]
+    bucket_stats = {}
     
-    # Group results by rating buckets
-    for _, row in results_df.iterrows():
-        rating = row.get('Rating', 1500)  # Default rating if not present
-        for min_rating, max_rating in config.rating_buckets:
-            if min_rating <= rating < max_rating:
-                results_by_rating[f"{min_rating}-{max_rating}"].append(row)
-                break
-    
-    # Calculate metrics for each bucket
-    bucket_metrics = {}
-    for bucket, results in results_by_rating.items():
-        if results:
-            df_bucket = pd.DataFrame(results)
-            bucket_metrics[bucket] = {
-                'count': len(results),
-                'accuracy': df_bucket['is_correct'].mean(),
-                'average_reward': df_bucket['reward'].mean(),
-                'stockfish_agreement': df_bucket['stockfish_agreement'].mean()
+    for min_rating, max_rating in buckets:
+        mask = (results_df['rating'] >= min_rating) & (results_df['rating'] < max_rating)
+        bucket_df = results_df[mask]
+        
+        if len(bucket_df) > 0:
+            bucket_stats[f"{min_rating}-{max_rating}"] = {
+                'count': len(bucket_df),
+                'accuracy': bucket_df['is_correct'].mean(),
+                'avg_confidence': bucket_df['confidence'].mean(),
+                'avg_value': bucket_df['value'].mean()
             }
     
-    return bucket_metrics
+    return bucket_stats
 
 
-def plot_metrics(metrics_history: dict, save_path: str):
-    """Plot training metrics"""
-    plt.figure(figsize=(15, 10))
+def analyze_by_theme(results_df):
+    """Analyze results by puzzle theme"""
+    theme_stats = defaultdict(lambda: {'count': 0, 'correct': 0})
     
-    # Plot accuracy and stockfish agreement
-    plt.subplot(2, 2, 1)
-    if 'puzzle_accuracy' in metrics_history:
-        plt.plot(metrics_history['puzzle_accuracy'], label='Puzzle Accuracy')
-    if 'stockfish_agreement' in metrics_history:
-        plt.plot(metrics_history['stockfish_agreement'], label='Stockfish Agreement')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy')
-    plt.title('Model Accuracy')
-    plt.legend()
-    plt.grid(True)
+    for _, row in results_df.iterrows():
+        if pd.notna(row['themes']):
+            themes = row['themes'].split()
+            for theme in themes:
+                theme_stats[theme]['count'] += 1
+                if row['is_correct']:
+                    theme_stats[theme]['correct'] += 1
     
-    # Plot average reward
-    plt.subplot(2, 2, 2)
-    if 'average_reward' in metrics_history:
-        plt.plot(metrics_history['average_reward'])
-    plt.xlabel('Epoch')
-    plt.ylabel('Average Reward')
-    plt.title('Average Reward per Epoch')
-    plt.grid(True)
+    # Calculate accuracy for each theme
+    theme_accuracy = {}
+    for theme, stats in theme_stats.items():
+        if stats['count'] > 10:  # Only include themes with sufficient puzzles
+            theme_accuracy[theme] = stats['correct'] / stats['count']
     
-    # Plot losses
-    plt.subplot(2, 2, 3)
-    if 'policy_loss' in metrics_history:
-        plt.plot(metrics_history['policy_loss'], label='Policy Loss')
-    if 'value_loss' in metrics_history:
-        plt.plot(metrics_history['value_loss'], label='Value Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training Losses')
-    plt.legend()
-    plt.grid(True)
-    
-    # Plot entropy
-    plt.subplot(2, 2, 4)
-    if 'entropy' in metrics_history:
-        plt.plot(metrics_history['entropy'])
-    plt.xlabel('Epoch')
-    plt.ylabel('Entropy')
-    plt.title('Policy Entropy')
-    plt.grid(True)
-    
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
+    return theme_accuracy
 
 
-def plot_difficulty_analysis(bucket_metrics: dict, save_path: str):
-    """Plot analysis by difficulty rating"""
-    buckets = list(bucket_metrics.keys())
-    accuracies = [bucket_metrics[b]['accuracy'] for b in buckets]
-    stockfish_agreements = [bucket_metrics[b]['stockfish_agreement'] for b in buckets]
-    counts = [bucket_metrics[b]['count'] for b in buckets]
+def plot_results(results_df, bucket_stats, theme_accuracy, output_dir):
+    """Create visualization plots"""
     
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
+    # Plot 1: Accuracy by rating
+    plt.figure(figsize=(10, 6))
+    buckets = list(bucket_stats.keys())
+    accuracies = [bucket_stats[b]['accuracy'] for b in buckets]
+    counts = [bucket_stats[b]['count'] for b in buckets]
     
-    # Plot accuracies
     x = range(len(buckets))
-    width = 0.35
+    bars = plt.bar(x, accuracies, alpha=0.8, color='skyblue')
     
-    ax1.bar([i - width/2 for i in x], accuracies, width, label='Puzzle Accuracy', alpha=0.8)
-    ax1.bar([i + width/2 for i in x], stockfish_agreements, width, label='Stockfish Agreement', alpha=0.8)
+    # Add count labels on bars
+    for i, (bar, count) in enumerate(zip(bars, counts)):
+        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                f'n={count}', ha='center', va='bottom', fontsize=10)
     
-    ax1.set_xlabel('Rating Bucket')
-    ax1.set_ylabel('Accuracy')
-    ax1.set_title('Model Performance by Puzzle Difficulty')
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(buckets, rotation=45)
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    
-    # Plot puzzle counts
-    ax2.bar(x, counts, alpha=0.8, color='green')
-    ax2.set_xlabel('Rating Bucket')
-    ax2.set_ylabel('Number of Puzzles')
-    ax2.set_title('Puzzle Distribution by Rating')
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(buckets, rotation=45)
-    ax2.grid(True, alpha=0.3)
-    
+    plt.xlabel('Rating Range')
+    plt.ylabel('Accuracy')
+    plt.title('Model Accuracy by Puzzle Rating')
+    plt.xticks(x, buckets, rotation=45)
+    plt.ylim(0, 1.1)
+    plt.grid(axis='y', alpha=0.3)
     plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, 'accuracy_by_rating.png'), dpi=300)
+    plt.close()
+    
+    # Plot 2: Top themes by accuracy
+    if theme_accuracy:
+        plt.figure(figsize=(12, 6))
+        # Sort themes by accuracy
+        sorted_themes = sorted(theme_accuracy.items(), key=lambda x: x[1], reverse=True)
+        top_themes = sorted_themes[:15]  # Top 15 themes
+        
+        themes, accuracies = zip(*top_themes)
+        x = range(len(themes))
+        
+        plt.bar(x, accuracies, alpha=0.8, color='lightgreen')
+        plt.xlabel('Puzzle Theme')
+        plt.ylabel('Accuracy')
+        plt.title('Model Accuracy by Puzzle Theme (Top 15)')
+        plt.xticks(x, themes, rotation=45, ha='right')
+        plt.ylim(0, 1.1)
+        plt.grid(axis='y', alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'accuracy_by_theme.png'), dpi=300)
+        plt.close()
+    
+    # Plot 3: Confidence distribution
+    plt.figure(figsize=(10, 6))
+    plt.hist(results_df['confidence'], bins=50, alpha=0.7, color='coral', edgecolor='black')
+    plt.xlabel('Prediction Confidence')
+    plt.ylabel('Count')
+    plt.title('Distribution of Model Confidence')
+    plt.grid(axis='y', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'confidence_distribution.png'), dpi=300)
+    plt.close()
+    
+    # Plot 4: Confidence vs Accuracy
+    plt.figure(figsize=(10, 6))
+    confidence_bins = pd.cut(results_df['confidence'], bins=10)
+    accuracy_by_confidence = results_df.groupby(confidence_bins)['is_correct'].mean()
+    
+    bin_centers = [interval.mid for interval in accuracy_by_confidence.index]
+    plt.plot(bin_centers, accuracy_by_confidence.values, marker='o', linewidth=2, markersize=8)
+    plt.xlabel('Prediction Confidence')
+    plt.ylabel('Accuracy')
+    plt.title('Accuracy vs Confidence')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'accuracy_vs_confidence.png'), dpi=300)
     plt.close()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate chess puzzle solver")
-    parser.add_argument("--model", type=str, required=True, help="Path to model checkpoint")
-    parser.add_argument("--data", type=str, required=True, help="Path to puzzle CSV file")
-    parser.add_argument("--output-dir", type=str, default="evaluation_results", help="Output directory for results")
-    parser.add_argument("--num-puzzles", type=int, help="Number of puzzles to evaluate")
-    parser.add_argument("--by-difficulty", action="store_true", help="Analyze results by difficulty rating")
+    parser = argparse.ArgumentParser(description='Evaluate Chess Puzzle Solver')
+    parser.add_argument('--model', type=str, required=True, help='Path to model checkpoint')
+    parser.add_argument('--data', type=str, required=True, help='Path to puzzle CSV file')
+    parser.add_argument('--split-file', type=str, help='Load data splits from file')
+    parser.add_argument('--use-test', action='store_true', help='Evaluate on test set')
+    parser.add_argument('--num-puzzles', type=int, help='Limit evaluation to N puzzles')
+    parser.add_argument('--output-dir', type=str, default='evaluation_results', help='Output directory')
+    parser.add_argument('--device', type=str, choices=['cuda', 'cpu', 'mps'], help='Device to use')
+    parser.add_argument('--themes', type=str, nargs='+', help='Filter puzzles by themes')
+    parser.add_argument('--max-puzzles', type=int, help='Maximum number of puzzles to use from dataset')
+    
     args = parser.parse_args()
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Set up logging
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(args.output_dir, f'evaluation_{timestamp}.log')
-    
+    # Setup logging
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s [%(levelname)s] %(message)s',
         handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler()
+            logging.FileHandler(os.path.join(args.output_dir, 'evaluation.log')),
+            logging.StreamHandler(sys.stdout)
         ]
     )
     
-    logging.info("Starting model evaluation")
+    # Device selection
+    if args.device:
+        device = args.device
+    else:
+        if torch.cuda.is_available():
+            device = 'cuda'
+        elif torch.backends.mps.is_available():
+            device = 'mps'
+        else:
+            device = 'cpu'
     
-    # Load configurations
-    train_config = TrainingConfig()
-    eval_config = EvaluationConfig()
+    logging.info(f"Using device: {device}")
     
-    if args.num_puzzles:
-        eval_config.num_puzzles = args.num_puzzles
+    # Load model
+    logging.info(f"Loading model from {args.model}")
+    checkpoint = torch.load(args.model, map_location=device)
     
-    # Initialize trainer and load model
-    trainer = PuzzleTrainer(train_config)
-    trainer.load_checkpoint(args.model)
+    # Detect architecture from checkpoint
+    if 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    else:
+        state_dict = checkpoint
     
-    # Load evaluation dataset
-    df = pd.read_csv(args.data)
-    df = df.dropna(subset=['FEN', 'Moves'])
+    # Detect parameters
+    channels = 256
+    num_blocks = 20
     
-    # Sample puzzles for evaluation
-    if len(df) > eval_config.num_puzzles:
-        df = df.sample(n=eval_config.num_puzzles, random_state=42)
+    conv_input_weight = state_dict.get('conv_input.weight', None)
+    if conv_input_weight is not None:
+        channels = conv_input_weight.shape[0]
     
-    puzzles = df.to_dict('records')
-    logging.info(f"Evaluating on {len(puzzles)} puzzles")
+    for key in state_dict.keys():
+        if key.startswith('residual_blocks.') and key.endswith('.conv1.weight'):
+            block_num = int(key.split('.')[1])
+            num_blocks = max(num_blocks, block_num + 1)
     
-    # Evaluate model
-    trainer.policy_network.eval()
-    trainer.value_network.eval()
+    logging.info(f"Detected architecture: {channels} channels, {num_blocks} blocks")
     
+    model = ChessPuzzleNet(num_blocks=num_blocks, channels=channels)
+    
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
+    
+    model.to(device)
+    model.eval()
+    
+    # Load dataset
+    logging.info(f"Loading dataset from {args.data}")
+    dataset = ChessPuzzleDataset(args.data, filter_themes=args.themes, max_puzzles=args.max_puzzles)
+    
+    if args.themes:
+        logging.info(f"Filtered by themes: {args.themes}")
+    
+    # Determine which dataset to evaluate
+    if args.split_file and os.path.exists(args.split_file):
+        logging.info(f"Loading data splits from {args.split_file}")
+        split_data = ChessPuzzleDataset.load_split_indices(args.split_file)
+        
+        if args.use_test:
+            eval_dataset = Subset(dataset, split_data['test_indices'])
+            logging.info(f"Evaluating on test set ({len(eval_dataset)} puzzles)")
+        else:
+            eval_dataset = Subset(dataset, split_data['val_indices'])
+            logging.info(f"Evaluating on validation set ({len(eval_dataset)} puzzles)")
+    else:
+        eval_dataset = dataset
+        logging.info(f"Evaluating on full dataset ({len(eval_dataset)} puzzles)")
+        if args.use_test:
+            logging.warning("--use-test specified but no split file provided. Evaluating on full dataset.")
+    
+    # Limit number of puzzles if specified
+    num_puzzles = min(args.num_puzzles if args.num_puzzles else len(eval_dataset), len(eval_dataset))
+    logging.info(f"Evaluating on {num_puzzles} puzzles")
+    
+    # Evaluate
     results = []
-    for i, puzzle in enumerate(puzzles):
-        is_correct, reward, puzzle_stats = trainer.train_on_puzzle(puzzle)
+    
+    for i in tqdm(range(num_puzzles), desc="Evaluating"):
+        board_tensor, policy_target, value_target, info = eval_dataset[i]
         
-        result = {
-            'puzzle_id': puzzle.get('PuzzleId', i),
-            'rating': puzzle.get('Rating', 1500),
-            'themes': puzzle.get('Themes', ''),
+        # Get solution move
+        solution_idx = torch.argmax(policy_target).item()
+        solution_move = ChessPuzzleDataset.index_to_move(solution_idx)
+        
+        # Get puzzle data for board recreation
+        if hasattr(eval_dataset, 'dataset'):  # If it's a Subset
+            actual_dataset = eval_dataset.dataset
+            actual_idx = eval_dataset.indices[i]
+        else:
+            actual_dataset = eval_dataset
+            actual_idx = i
+        
+        puzzle = actual_dataset.puzzles.iloc[actual_idx]
+        board = chess.Board(puzzle['FEN'])
+        moves = puzzle['Moves'].split()
+        if len(moves) > 0:
+            board.push_uci(moves[0])  # Apply setup move
+        
+        legal_moves = list(board.legal_moves)
+        
+        # Evaluate
+        is_correct, predicted_move, confidence, value = evaluate_puzzle(
+            model, board_tensor, solution_move, legal_moves, device
+        )
+        
+        results.append({
+            'puzzle_id': info['puzzle_id'],
+            'rating': info['rating'],
+            'themes': info['themes'],
             'is_correct': is_correct,
-            'reward': reward,
-            'stockfish_agreement': puzzle_stats.get('stockfish_agreement', False),
-            'selected_move': puzzle_stats.get('selected_move', ''),
-            'correct_move': puzzle_stats.get('correct_move', ''),
-            'stockfish_best': puzzle_stats.get('stockfish_best', '')
-        }
-        results.append(result)
-        
-        if (i + 1) % 100 == 0:
-            logging.info(f"Evaluated {i + 1}/{len(puzzles)} puzzles")
+            'solution': solution_move.uci(),
+            'predicted': predicted_move.uci(),
+            'confidence': confidence,
+            'value': value,
+            'num_legal_moves': len(legal_moves)
+        })
     
     # Convert results to DataFrame
     results_df = pd.DataFrame(results)
     
     # Calculate overall metrics
-    overall_metrics = {
-        'total_puzzles': len(results_df),
-        'accuracy': results_df['is_correct'].mean(),
-        'average_reward': results_df['reward'].mean(),
-        'stockfish_agreement': results_df['stockfish_agreement'].mean()
-    }
+    overall_accuracy = results_df['is_correct'].mean()
+    avg_confidence = results_df['confidence'].mean()
+    avg_value = results_df['value'].mean()
     
-    # Analyze by difficulty if requested
-    difficulty_metrics = None
-    if args.by_difficulty and 'Rating' in results_df.columns:
-        difficulty_metrics = analyze_by_difficulty(results_df, eval_config)
+    logging.info(f"Overall Accuracy: {overall_accuracy:.4f}")
+    logging.info(f"Average Confidence: {avg_confidence:.4f}")
+    logging.info(f"Average Value: {avg_value:.4f}")
     
-    # Save results
-    results_df.to_csv(os.path.join(args.output_dir, f'evaluation_results_{timestamp}.csv'), index=False)
+    # Analyze by rating
+    bucket_stats = analyze_by_rating(results_df)
     
-    # Save metrics
-    metrics_output = {
-        'overall': overall_metrics,
-        'by_difficulty': difficulty_metrics,
-        'timestamp': timestamp,
-        'model_path': args.model,
-        'num_puzzles': len(puzzles)
-    }
+    logging.info("\nAccuracy by Rating:")
+    for bucket, stats in bucket_stats.items():
+        logging.info(f"  {bucket}: {stats['accuracy']:.4f} ({stats['count']} puzzles)")
     
-    with open(os.path.join(args.output_dir, f'evaluation_metrics_{timestamp}.json'), 'w') as f:
-        json.dump(metrics_output, f, indent=2)
+    # Analyze by theme
+    theme_accuracy = analyze_by_theme(results_df)
+    
+    if theme_accuracy:
+        logging.info("\nTop 10 Themes by Accuracy:")
+        sorted_themes = sorted(theme_accuracy.items(), key=lambda x: x[1], reverse=True)
+        for theme, accuracy in sorted_themes[:10]:
+            logging.info(f"  {theme}: {accuracy:.4f}")
     
     # Create visualizations
-    if hasattr(trainer, 'metrics') and trainer.metrics:
-        plot_metrics(trainer.metrics, os.path.join(args.output_dir, f'training_metrics_{timestamp}.png'))
+    plot_results(results_df, bucket_stats, theme_accuracy, args.output_dir)
     
-    if difficulty_metrics:
-        plot_difficulty_analysis(difficulty_metrics, os.path.join(args.output_dir, f'difficulty_analysis_{timestamp}.png'))
+    # Save detailed results
+    results_df.to_csv(os.path.join(args.output_dir, 'evaluation_results.csv'), index=False)
     
-    # Print summary
-    logging.info("\n" + "="*50)
-    logging.info("EVALUATION SUMMARY")
-    logging.info("="*50)
-    logging.info(f"Total Puzzles: {overall_metrics['total_puzzles']}")
-    logging.info(f"Accuracy: {overall_metrics['accuracy']:.4f}")
-    logging.info(f"Average Reward: {overall_metrics['average_reward']:.4f}")
-    logging.info(f"Stockfish Agreement: {overall_metrics['stockfish_agreement']:.4f}")
+    # Save summary statistics
+    summary = {
+        'overall_accuracy': overall_accuracy,
+        'average_confidence': avg_confidence,
+        'average_value': avg_value,
+        'num_puzzles_evaluated': num_puzzles,
+        'dataset_type': 'test' if args.use_test else 'validation' if args.split_file else 'full',
+        'model_path': args.model,
+        'data_path': args.data,
+        'themes': args.themes
+    }
     
-    if difficulty_metrics:
-        logging.info("\nPerformance by Difficulty:")
-        for bucket, metrics in difficulty_metrics.items():
-            logging.info(f"  {bucket}: Accuracy={metrics['accuracy']:.4f}, Count={metrics['count']}")
+    if bucket_stats:
+        summary['accuracy_by_rating'] = bucket_stats
     
-    logging.info("="*50)
-    logging.info(f"Results saved to {args.output_dir}")
+    if theme_accuracy:
+        sorted_themes = sorted(theme_accuracy.items(), key=lambda x: x[1], reverse=True)
+        summary['top_10_themes'] = dict(sorted_themes[:10])
+    
+    with open(os.path.join(args.output_dir, 'evaluation_summary.json'), 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    logging.info(f"\nResults saved to {args.output_dir}")
+    logging.info("Evaluation completed!")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

@@ -1,3 +1,9 @@
 data/lichess_db_puzzle.csv
 logs/
 models/
+my_training_run/
+matein2_results/
+matein3_results/
+dist/
+build/
+chess_puzzle_solver_proven.egg-info/
